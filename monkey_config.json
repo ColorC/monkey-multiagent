@@ -1,0 +1,6 @@
+{
+    "executor": "claude",
+    "reviewer": "gemini",
+    "inactivity_timeout": 60,
+    "max_auto_retries": 1
+}
