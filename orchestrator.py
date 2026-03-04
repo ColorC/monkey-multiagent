@@ -2,187 +2,211 @@ import os
 import subprocess
 import time
 import sys
+import datetime
+import re
+import signal
+import threading
+from pathlib import Path
 
 # --- Configuration ---
-# You can customize these commands based on your PATH and flags
-AGENT_EXECUTOR = "claude"
-AGENT_REVIEWER = "gemini"
-STATUS_DIR = "status"
-LOGS_DIR = "logs"
-TASK_FILE = "TASK.md"
+AGENT_EXECUTOR = os.getenv("MONKEY_EXECUTOR", "claude")
+AGENT_REVIEWER = os.getenv("MONKEY_REVIEWER", "gemini")
 
-# Specific flags for non-interactive / autonomous mode
-# Claude Code: --dangerously-skip-permissions for full shell access
-# Gemini CLI: --yolo for autonomous mode
-CMD_CLAUDE = "claude "{prompt}" --dangerously-skip-permissions"
-CMD_GEMINI = "gemini "{prompt}" --yolo"
+BASE_DIR = Path(__file__).resolve().parent
+SESSIONS_ROOT = BASE_DIR / "sessions"
+CURRENT_PROJECT_ROOT = BASE_DIR
 
-def run_command(cmd):
-    print(f"
-[Running]: {cmd}")
-    # Stream output to console
-    process = subprocess.Popen(cmd, shell=True, stdout=sys.stdout, stderr=sys.stderr)
-    process.wait()
+def monitor_sentinels(process, session_dir, stop_event):
+    """Background monitor: Kills the process if marker files appear."""
+    markers = ["STOP.md", "HANDOVER.md", "CONTINUE.md"]
+    while not stop_event.is_set():
+        if process.poll() is not None:
+            break
+        for m in markers:
+            if (session_dir / m).exists():
+                print(f"\n[Monkey] {m} detected. Turn complete. Ending process...")
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                except:
+                    process.terminate()
+                return
+        time.sleep(1)
 
-def setup():
-    for d in [STATUS_DIR, LOGS_DIR]:
-        if not os.path.exists(d):
-            os.makedirs(d, exist_ok=True)
-    if not os.path.exists(TASK_FILE):
-        with open(TASK_FILE, "w") as f:
-            f.write("# Mission Objective
-Write your requirements here...")
-        print(f"Please fill in your requirements in {TASK_FILE} and run again.")
-        sys.exit(0)
+def run_agent_interactive(cmd_list, session_dir):
+    """Runs the agent in the foreground with full TTY transparency."""
+    print(f"\n[EXEC]: {' '.join(cmd_list)}\n" + "="*60)
+    for s in ["STOP.md", "HANDOVER.md", "CONTINUE.md"]:
+        if (session_dir / s).exists(): (session_dir / s).unlink()
 
-def clear_status():
-    for f in ["STOP", "CONTINUE", "HANDOVER", "TO_HUMAN"]:
-        p = os.path.join(STATUS_DIR, f)
-        if os.path.exists(p):
-            os.remove(p)
+    process = subprocess.Popen(
+        cmd_list,
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+        preexec_fn=os.setsid 
+    )
 
-def get_status_content(filename):
-    p = os.path.join(STATUS_DIR, filename)
-    if os.path.exists(p):
-        with open(p, "r", encoding="utf-8") as f:
-            return f.read().strip()
+    stop_event = threading.Event()
+    monitor_thread = threading.Thread(target=monitor_sentinels, args=(process, session_dir, stop_event))
+    monitor_thread.start()
+
+    try:
+        process.wait()
+    except KeyboardInterrupt:
+        print("\n[User Abort]")
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    finally:
+        stop_event.set()
+        monitor_thread.join(timeout=1)
+    print("="*60 + "\n")
+
+def setup_session(instruction=None, resume_path=None):
+    if not SESSIONS_ROOT.exists():
+        SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
+    if resume_path:
+        session_path = Path(resume_path)
+    else:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        clean_name = re.sub(r'[/]', '_', instruction[:50]).strip()
+        session_path = SESSIONS_ROOT / f"{timestamp}_{clean_name}"
+    session_path.mkdir(parents=True, exist_ok=True)
+    (session_path / "logs").mkdir(parents=True, exist_ok=True)
+    task_file = session_path / "TASK.md"
+    if instruction:
+        task_file.write_text(instruction, encoding="utf-8")
+    return session_path
+
+def get_status_content(session_path, name, truncate=None):
+    p = session_path / f"{name}.md"
+    if p.exists():
+        content = p.read_text(encoding="utf-8").strip()
+        if truncate and len(content) > truncate:
+            return content[:truncate] + "\n\n...(Truncated for brevity, please audit the actual files)..."
+        return content
     return None
 
-def git_checkpoint(message):
-    if os.path.exists(".git"):
-        print(f"
-[Git]: Creating checkpoint - {message}")
-        subprocess.run("git add .", shell=True)
-        subprocess.run(f'git commit -m "{message}" --allow-empty', shell=True)
-
-def main():
-    setup()
-    
+def orchestrate(session_path):
+    session_abs = session_path.absolute()
     executor = AGENT_EXECUTOR
     reviewer = AGENT_REVIEWER
     iteration = 1
-
-    print("=== Minimal Multi-Agent Orchestrator Starting ===")
-
+    
     while True:
-        print(f"
---- Round {iteration} ---")
+        task_file = session_path / "TASK.md"
+        if not task_file.exists(): break
+        task_desc = task_file.read_text(encoding="utf-8")
         
-        last_feedback = get_status_content("CONTINUE")
-        task_desc = open(TASK_FILE, "r", encoding="utf-8").read()
+        # --- [HUMAN VIEW] ---
+        print(f"\n🚀 [Iteration {iteration}] Alpha Monkey (Executor): {executor}")
         
-        # 1. Prepare Executor Prompt
-        prompt = f"### TASK OBJECTIVE ###
-{task_desc}
-
-"
+        last_feedback = get_status_content(session_path, "CONTINUE")
+        
+        # --- [AI PROMPT: PROFESSIONAL EXECUTOR] ---
+        prompt = (
+            f"### ROLE ###\n"
+            f"You are a Lead Software Engineer. Your goal is to implement the requested features or fixes. "
+            f"Be surgical, follow best practices, and work autonomously.\n\n"
+            f"### MISSION OBJECTIVE ###\n{task_desc}\n\n"
+        )
         if last_feedback:
-            prompt += f"### REVIEWER FEEDBACK ###
-{last_feedback}
-
-"
+            prompt += f"### REVISION REQUIREMENTS (From Architect) ###\n{last_feedback}\n\n"
         
         prompt += (
-            "### INSTRUCTION ###
-"
-            "You are the EXECUTOR. Execute the task. Use bash as needed.
-"
-            "1. If you believe you are DONE, you MUST create 'status/STOP' and write a summary of your work inside it.
-"
-            "2. If you find the task IMPOSSIBLE or too complex, you MUST create 'status/HANDOVER' and explain why.
-"
-            "Do NOT ask for confirmation. Work autonomously."
+            f"### OPERATIONAL PROTOCOL ###\n"
+            f"1. Project Root: {CURRENT_PROJECT_ROOT}\n"
+            f"2. SUCCESS: Once complete, write a professional summary of changes to: {session_abs}/STOP.md\n"
+            f"3. STUCK: If you encounter an unresolvable blocker, write the technical reason to: {session_abs}/HANDOVER.md\n"
+            f"IMPORTANT: Your turn ends immediately upon writing either file. Do not wait for user input."
         )
 
-        # 2. Run Executor
-        clear_status()
-        exec_cmd = CMD_CLAUDE if executor == "claude" else CMD_GEMINI
-        run_command(exec_cmd.format(prompt=prompt))
+        if executor == "claude":
+            cmd = ["claude", "--dangerously-skip-permissions", prompt]
+        elif executor == "gemini":
+            cmd = ["gemini", "--yolo", prompt]
+        else:
+            cmd = [executor, prompt]
+            
+        run_agent_interactive(cmd, session_path)
 
-        # 3. Check for Handover
-        if os.path.exists(os.path.join(STATUS_DIR, "HANDOVER")):
-            reason = get_status_content("HANDOVER")
-            print(f"
-[Handoff]: {executor} requested handover. Reason: {reason}")
-            executor, reviewer = reviewer, executor # Swap roles
+        if (session_abs / "HANDOVER.md").exists():
+            print(f"\n[Monkey] Alpha Monkey requested handoff.")
+            executor, reviewer = reviewer, executor
             continue
 
-        # 4. Check for Stop/Review
-        if os.path.exists(os.path.join(STATUS_DIR, "STOP")):
-            summary = get_status_content("STOP")
-            print(f"
-[Review]: {executor} completed work. Invoking Reviewer ({reviewer})...")
+        if (session_abs / "STOP.md").exists():
+            summary_snippet = get_status_content(session_path, "STOP", truncate=1200)
             
+            # --- [HUMAN VIEW] ---
+            print(f"\n🔍 [Iteration {iteration}] Wise Monkey (Reviewer): {reviewer}")
+            
+            # --- [AI PROMPT: PROFESSIONAL REVIEWER] ---
             review_prompt = (
-                f"### TASK OBJECTIVE ###
-{task_desc}
-
-"
-                f"### EXECUTOR SUMMARY ###
-{summary}
-
-"
-                "### INSTRUCTION ###
-"
-                "You are the REVIEWER. Check the work performed by the executor.
-"
-                "1. If it's CORRECT and COMPLETE, do NOTHING (the orchestrator will finish).
-"
-                "2. If it's WRONG or INCOMPLETE, you MUST create 'status/CONTINUE' with specific feedback.
-"
-                "3. If you can't review or think you should take over, create 'status/HANDOVER'.
-"
-                "Do NOT ask for confirmation."
+                f"### ROLE ###\n"
+                f"You are a Senior Software Architect and Auditor. Your goal is to verify the work performed by the implementation engineer. "
+                f"Do not take their word for granted; inspect the codebase directly for correctness, performance, and adherence to requirements.\n\n"
+                f"### ORIGINAL MISSION ###\n{task_desc}\n\n"
+                f"### IMPLEMENTATION SUMMARY (Snippet) ###\n{summary_snippet}\n\n"
+                f"### AUDIT INSTRUCTIONS ###\n"
+                f"1. Audit the codebase at: {CURRENT_PROJECT_ROOT}\n"
+                f"2. REJECT: If requirements are missing or code is flawed, write specific feedback to: {session_abs}/CONTINUE.md\n"
+                f"3. TAKE OVER: If you need to perform the fix yourself, write your intent to: {session_abs}/HANDOVER.md\n"
+                f"4. PASS: If everything is perfect, simply exit/abort without writing any marker files."
             )
-
-            review_cmd = CMD_GEMINI if reviewer == "gemini" else CMD_CLAUDE
-            run_command(review_cmd.format(prompt=review_prompt))
-
-            # Handle Reviewer Outcome
-            if os.path.exists(os.path.join(STATUS_DIR, "CONTINUE")):
-                print(f"
-[Result]: Review failed. Retrying...")
-                git_checkpoint(f"Round {iteration}: Review failed, moving to fix.")
+            
+            if (session_path / "CONTINUE.md").exists(): (session_path / "CONTINUE.md").unlink()
+            
+            if reviewer == "gemini":
+                cmd_rev = ["gemini", "--yolo", review_prompt]
+            elif reviewer == "claude":
+                cmd_rev = ["claude", "--dangerously-skip-permissions", review_prompt]
+            else:
+                cmd_rev = [reviewer, review_prompt]
+            
+            run_agent_interactive(cmd_rev, session_path)
+            
+            if (session_path / "CONTINUE.md").exists():
+                print(f"\n❌ [Audit] Wise Monkey rejected the work. Sending back for revisions.")
                 iteration += 1
                 continue
-            elif os.path.exists(os.path.join(STATUS_DIR, "HANDOVER")):
-                if executor == AGENT_REVIEWER: # Both tried
-                     with open(os.path.join(STATUS_DIR, "TO_HUMAN"), "w") as f:
-                         f.write("Both agents requested handover.")
-                else:
-                    executor, reviewer = reviewer, executor
-                    continue
+            elif (session_path / "HANDOVER.md").exists():
+                executor, reviewer = reviewer, executor
+                continue
             else:
-                print(f"
-[Success]: Task completed successfully!")
-                git_checkpoint(f"Round {iteration}: Task completed.")
+                print(f"\n✅ [Success] Wise Monkey approved the work. Mission Accomplished!")
                 break
 
-        # 5. Help/Human Intervention
-        if os.path.exists(os.path.join(STATUS_DIR, "TO_HUMAN")):
-            print(f"
-[HELP REQUIRED]: Agents have stalled.")
-            human_input = input("Enter instruction for the Executor (or 'exit'): ")
-            if human_input.lower() == 'exit':
-                break
-            with open(os.path.join(STATUS_DIR, "CONTINUE"), "w") as f:
-                f.write(f"Human intervention: {human_input}")
-            # Reset to original executor if needed or keep current
+        print(f"\n⚠️ Agent exited without status update.")
+        choice = input("[r]etry, [h]andover, [f]eedback, [q]uit: ").lower()
+        if choice == 'r': iteration += 1; continue
+        elif choice == 'h': executor, reviewer = reviewer, executor; continue
+        elif choice == 'f':
+            f_text = input("Enter manual feedback: ")
+            (session_path / "CONTINUE.md").write_text(f_text, encoding="utf-8")
             continue
+        else: break
 
-        # Fallback if no file created
-        print("
-[Warning]: Agent exited without creating any status file.")
-        human_input = input("Continue anyway? (y/n) or 'handover': ")
-        if human_input.lower() == 'y':
-            iteration += 1
-            continue
-        elif human_input.lower() == 'handover':
-            executor, reviewer = reviewer, executor
-        else:
-            break
-
-        time.sleep(1)
+def main():
+    print("=== MONKEY'S MULTIAGENT: Just Files. No Magic. ===")
+    while True:
+        if not SESSIONS_ROOT.exists(): SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
+        try:
+            sessions = sorted([d for d in SESSIONS_ROOT.iterdir() if d.is_dir()], reverse=True)
+        except:
+            sessions = []
+            
+        print(f"\nSession History:")
+        print(f"0. [CREATE NEW MISSION]")
+        for i, s in enumerate(sessions, 1):
+            print(f"{i}. {s.name}")
+            
+        choice = input("\nSelect Index (q to quit): ")
+        if choice.lower() == 'q': break
+        if choice == '0':
+            task = input("Enter Objective: ")
+            if not task: continue
+            orchestrate(setup_session(instruction=task))
+        elif choice.isdigit() and 0 < int(choice) <= len(sessions):
+            orchestrate(sessions[int(choice)-1])
 
 if __name__ == "__main__":
     main()
